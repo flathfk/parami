@@ -1,5 +1,5 @@
 > **📌 이 저장소는 포트폴리오용 포크입니다.**
-> 원본: [team-alpha-labs/parami](https://github.com/team-alpha-labs/parami) · 팀 7명 · 2026.05
+> 원본: [team-alpha-labs/parami](https://github.com/team-alpha-labs/parami) · 팀 4명 · 2026.05
 > 아래는 **임소라(flathfk)가 이 프로젝트에서 맡은 부분**이고, 원본 README는 이어서 나옵니다.
 
 # 내가 한 일 — 결제 · 구독 · 보상조회
