@@ -1,3 +1,235 @@
+> **📌 이 저장소는 포트폴리오용 포크입니다.**
+> 원본: [team-alpha-labs/parami](https://github.com/team-alpha-labs/parami) · 팀 7명 · 2026.05
+> 아래는 **임소라(flathfk)가 이 프로젝트에서 맡은 부분**이고, 원본 README는 이어서 나옵니다.
+
+# 내가 한 일 — 결제 · 구독 · 보상조회
+
+한경 × 토스뱅크 FullStack-LLM 부트캠프 **중간 프로젝트**
+**51커밋 / 전체 271커밋 중 2위** · TypeScript · MySQL · 토스페이먼츠 · GCP Cloud Scheduler
+
+**돈이 오가는 도메인**을 맡았습니다. 결제가 한 번 잘못되면 사용자가 실제로 손해를 보기 때문에, 기능을 넓히기보다 **실패 경로를 하나씩 닫는 데** 시간을 썼습니다.
+
+## 결제 안전망 4단계
+
+토스 결제 후 발생할 수 있는 실패 케이스를 단계별로 막았습니다.
+
+| 단계 | 방어 대상 | 안전장치 |
+| --- | --- | --- |
+| 1 | 클라이언트 가격 변조 | 서버 DB 가격 재조회 후 amount 비교 |
+| 2 | 토스 위변조 결제 | 토스 confirm API로 재검증 (Basic Auth) |
+| 3 | DB 부분 저장 사고 | 트랜잭션 BEGIN ~ COMMIT |
+| 4 | DB 저장 실패 시 사용자 돈 묶임 | 자동 환불 호출 → 환불 실패 시 운영자 알림 |
+
+---
+
+# 트러블슈팅
+
+## 1. 결제 성공 직후 DB 저장 실패 → 사용자 돈이 묶임
+
+**문제** 토스 결제는 됐는데 우리 DB INSERT가 실패하면, **사용자 돈은 빠졌고 시스템엔 기록이 없는** 최악의 상태가 됩니다.
+
+**원인** 초기 코드는 DB 실패 시 그냥 500 응답만 줬습니다. 사용자 입장에선 "결제는 됐는데 구독은 안 된" 상태로 방치됩니다.
+
+**해결** DB 처리를 별도 try/catch로 감싸 실패 시 토스 환불 API를 자동 호출합니다.
+
+```ts
+try {
+  const result = await processConfirmedPayment(...)
+  return ok(result)
+} catch (dbError) {
+  try {
+    await cancelTossPayment(body.paymentKey, '서버 DB 처리 실패로 인한 자동 환불')
+    return err('자동 환불되었습니다.', 500)
+  } catch (refundError) {
+    console.error('CRITICAL: 환불 자체 실패 — 운영자 수동 처리 필요', ...)
+    return err('고객센터 문의 바랍니다.', 500)
+  }
+}
+```
+
+3단계 분기 — DB 성공 / DB 실패 후 환불 성공 / **환불도 실패**. 마지막 경우는 자동으로 못 닫으므로 운영자가 볼 수 있게 CRITICAL 로그를 남깁니다.
+
+**교훈** 외부 결제 연동에선 자동 환불 분기가 필수. 더 정석은 환불 재시도 큐 도입(향후).
+
+## 2. 클라이언트 가격 변조 공격
+
+**문제** 브라우저 개발자도구로 `{ tier: 'premium', amount: 7400 }` 같은 위변조 요청이 가능합니다. 프리미엄을 베이직 가격에 사는 겁니다.
+
+**원인** 초기 코드가 body의 tier/amount를 **그대로 토스에 전달**했습니다. 토스는 자기네 결제 정보만 검증하므로 amount만 일치하면 통과시킵니다 — **우리가 안 보면 아무도 안 봅니다.**
+
+**해결** 서버가 DB에서 가격을 재조회해 비교하고, 적용할 티어도 **서버가 결정**합니다.
+
+```ts
+// 기존 구독자는 서버 권위로 결정 — body의 tier를 믿지 않음
+const effectiveTier = currentSub
+  ? (currentSub.pending_tier ?? currentSub.tier)
+  : body.tier                                     // 신규 가입만 body 신뢰
+
+const plan = await findPlanByTier(effectiveTier)
+if (plan.price !== body.amount) {
+  return err('결제 금액이 티어 가격과 일치하지 않습니다.', 400)
+}
+```
+
+**교훈** 클라이언트 값은 절대 신뢰하지 않는다. DB가 진실의 원천.
+
+## 3. 같은 사용자 동시 결제 → active 구독 중복 생성
+
+**문제** 빠른 연타나 네트워크 지연으로 같은 요청 2개가 동시에 들어오면, 둘 다 "active 없음"을 보고 **둘 다 INSERT**합니다.
+
+**원인** MySQL REPEATABLE READ 스냅샷 + **부분 UNIQUE 인덱스 미지원**으로 write skew가 발생합니다. `WHERE status='active'` 조건부 유니크를 DB가 못 걸어줍니다.
+
+**해결** 앱 레벨 3중 안전망:
+
+```sql
+-- 1. 락 (X-lock) — 같은 user_id 요청을 직렬화
+SELECT id FROM users WHERE id = ? FOR UPDATE
+
+-- 2. 락 잡은 후 재조회 — 다른 트랜잭션이 만든 active가 이제 보임
+SELECT ... FROM subscriptions
+WHERE user_id = ? AND status = 'active'
+ORDER BY started_at DESC, id DESC
+LIMIT 1  -- 3. 안전망: 만약 2개 생겨도 1개만 반환
+```
+
+**교훈** 동시성은 단위 테스트로 못 잡습니다. 트랜잭션 + 락 + 안전망 다층 방어.
+
+## 4. 결제 확정 중복 요청 (새로고침 / React strict mode)
+
+**문제** 결제완료 페이지에서 새로고침하면 confirm을 또 호출합니다 → **두 번 청구** 가능. 여기에 React 19 strict mode가 `useEffect`를 두 번 실행해 같은 일이 개발 중에도 재현됐습니다.
+
+**해결 — 두 겹**
+
+| 겹 | 수단 |
+| --- | --- |
+| DB | `UNIQUE KEY uq_toss_order (toss_order_id)` → 중복 INSERT 시 `Duplicate entry` → ROLLBACK |
+| 프론트 | `useRef` 가드 → strict mode 2회 실행 차단 |
+
+```ts
+const calledRef = useRef(false)
+useEffect(() => {
+  if (calledRef.current) return
+  calledRef.current = true
+  // confirm 호출 ...
+}, [...])
+```
+
+**교훈** strict mode 대응은 개발용 회피가 아닙니다. **네트워크 retry, 빠른 클릭 같은 실제 운영 상황과 같은 문제**라, 대응해두면 운영에서도 그대로 효과가 있습니다. 멱등성의 최종 보루는 DB UNIQUE 제약입니다.
+
+## 5. 티어 변경 시 차액 계산의 복잡도
+
+**문제** 월 중간에 베이직(7,400원) → 프리미엄(20,600원) 변경 시 차액 13,200원 처리가 복잡합니다. 일할 계산 + 부분 환불은 **사용자에게 설명하기 어렵고 운영 부담도 큽니다.**
+
+**해결 — `pending_tier` 예약 매커니즘**
+
+차액을 계산하는 대신 **적용 시점을 미룹니다.**
+
+```
+[5/14] 베이직 결제        → tier='basic',   pending_tier=NULL
+[5/20] 프리미엄 변경 요청 → tier='basic' 유지, pending_tier='premium'
+[6/14] 결제 시점          → effectiveTier='premium'으로 청구
+                           → tier='premium', pending_tier=NULL
+```
+
+마이그레이션 001로 컬럼 추가 + change-tier API + `processConfirmedPayment` 적용 분기 3곳에 통합.
+
+**교훈** 정책 결정은 기술뿐 아니라 **운영 부담과 사용자 이해도까지** 고려해야 합니다. 기술적으로 가능한 것과 운영할 수 있는 것은 다릅니다.
+
+## 6. 결제 안 한 좀비 active 구독
+
+**문제** 단건 결제 모델이라 자동 갱신이 없는데, `next_billing_at`이 지나도 status는 계속 `active`로 남습니다 → **돈 안 낸 사람이 보상을 받는** 사고.
+
+**원인** 초기 status가 `active` / `cancelled` 둘뿐이라 **"결제 끊김"을 표현할 상태가 없었습니다.**
+
+**해결**
+
+1. 마이그레이션 002에서 `status ENUM`에 `expired` 추가 — **`cancelled`(본인 의지)와 분리**
+2. Cloud Scheduler가 매일 새벽 KST 03:00에 자동 만료 처리
+
+```sql
+UPDATE subscriptions SET status='expired'
+WHERE status='active' AND next_billing_at < UTC_TIMESTAMP()
+```
+
+- Bearer 토큰 인증으로 외부 임의 호출 차단
+- 5xx 자동 재시도
+
+**교훈** 시간 기반 자동 처리가 좀비 데이터를 막습니다. **종료 사유를 구분해두면** 나중에 "이탈률"과 "결제 실패율"을 따로 볼 수 있습니다.
+
+## 7. UTC와 KST 혼용으로 결제일이 어긋남
+
+**문제** 한국 5/31 밤 11시 결제 → 서버 `NOW()`가 UTC라 6/1 02시로 기록 → 사용자는 "5월 결제"로 인식하는데 시스템은 **"6월 결제"로 처리**합니다.
+
+**원인** MySQL `NOW()`가 서버 timezone(GCP 기본 UTC) 의존.
+
+**해결 — 컬럼의 성격에 따라 정책을 나눴습니다**
+
+| 컬럼 종류 | 타임존 | 이유 |
+| --- | --- | --- |
+| DATETIME (`started_at`, `paid_at`, `cancelled_at`) | **UTC** (`UTC_TIMESTAMP()` 명시) | 서버 timezone이 바뀌어도 값이 안 흔들림 |
+| YEAR / MONTH (`billing_year`, `billing_month`) | **KST 계산** | "한국 사용자의 5월"이라는 **의미**를 담는 값 |
+
+```ts
+const kst = new Date(now.getTime() + 9 * 60 * 60 * 1000)
+const billingYear = kst.getUTCFullYear()
+const billingMonth = kst.getUTCMonth() + 1
+```
+
+**교훈** 글로벌 서비스가 아니어도 timezone 정책은 처음부터 명확히. **코드 헤더 주석에 명시해** 후속 컬럼도 같은 패턴을 따르도록 했습니다.
+
+## 8. React 19 strict purity가 정상 코드를 막음
+
+**문제** `Date.now()` / `Math.random()`을 이벤트 핸들러 안에서 호출했는데 `react-hooks/purity` lint가 **빌드를 실패**시켰습니다.
+
+**원인** React 19 strict 룰이 컴포넌트 본체 안의 불순 함수 호출을 전부 잡습니다. 이벤트 핸들러는 렌더 중 실행되지 않지만 **정적 분석으로는 구분할 수 없습니다.**
+
+**해결** 룰을 끄지 않고 모듈 레벨 헬퍼로 분리했습니다.
+
+```ts
+// 모듈 레벨 — lint 통과
+function generateOrderId() {
+  return `parami_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+}
+```
+
+**교훈** lint false positive는 **룰을 끄지 말고 패턴을 바꿔 우회**합니다. 결과적으로 "이건 렌더와 무관한 함수"라는 의도가 코드 구조에 드러나 더 명확해졌습니다.
+
+---
+
+# 보안 · 설계 판단
+
+## `toss_payment_key` 를 응답에서 제외
+
+이 값은 **환불 권한 토큰**이라 클라이언트에 노출되면 환불 사기가 가능합니다. 실수로 흘리지 않도록 TypeScript 타입으로 강제했습니다.
+
+```ts
+export type PaymentPublic = Omit<PaymentRow, 'toss_payment_key'>
+```
+
+SELECT 쿼리에서도 해당 컬럼을 빼고 가져옵니다. **타입과 쿼리 양쪽에서** 막아, 한쪽을 잊어도 다른 쪽이 걸립니다.
+
+## PR 리뷰에서 잡힌 것 — 코드와 안내문 불일치
+
+| 안내문 | 실제 동작 | 조치 |
+| --- | --- | --- |
+| "매월 N일에 **자동 결제**됩니다" | 단건 결제라 자동 갱신 없음 | "자동으로 갱신되지 않아요. 매월 N일에 직접 결제해야 이어서 이용할 수 있어요." |
+| "카드 또는 **계좌이체** 선택 가능" | `requestPayment('카드', ...)` — 카드만 | "토스페이먼츠를 통해 카드로 안전하게 결제돼요." |
+
+**교훈** 디자인 시안을 그대로 따르기 전에 **비즈니스 정책을 먼저 확인**해야 합니다. 코드와 안내문이 어긋나면 사용자 신뢰를 잃는데, 이건 버그로 안 잡힙니다. 향후 멀티 결제수단 도입 시 `@tosspayments/payment-widget-sdk` 전환이 필요하다는 것도 코드 주석에 남겨뒀습니다.
+
+## UX 라이팅을 근거 기반으로 통일
+
+초기 UI 문구가 `~합니다` / `~해요` 혼재였습니다. 취향으로 정하지 않고 **Apps in Toss UX 라이팅 가이드**를 찾아 적용했습니다.
+
+- 제품 UI 문구: `~돼요 / ~해요 / ~예요` 통일 (4개 페이지 + 토스트 전수 검토)
+- 경어 의문형(`~시나요? / ~셨나요?`)은 가이드가 인정하는 예외로 유지
+- 약관 본문은 제품 UI가 아니므로 격식체 유지
+
+**교훈** 톤은 "이게 더 예쁜 것 같다"로 정하면 리뷰에서 매번 다시 논쟁합니다. **가이드 문서를 인용할 수 있으면** 한 번에 끝납니다.
+
+---
+---
+
 # Parami
 
 Parami는 기상 데이터가 정해진 조건을 넘으면 별도 청구 없이 보상금을 자동 지급하는 날씨 기반 구독형 보상 서비스입니다. 사용자는 플랜을 구독하고, 시스템은 정기적으로 날씨를 수집해 트리거를 판정한 뒤 자격 있는 사용자에게 포인트를 적립합니다.
