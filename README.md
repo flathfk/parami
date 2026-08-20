@@ -5,7 +5,7 @@
 # 내가 한 일 — 결제 · 구독 · 보상조회
 
 한경 × 토스뱅크 FullStack-LLM 부트캠프 **중간 프로젝트**
-**51커밋 / 전체 271커밋 중 2위** · TypeScript · MySQL · 토스페이먼츠 · GCP Cloud Scheduler
+TypeScript · MySQL · 토스페이먼츠 · GCP Cloud Scheduler
 
 🔗 **배포** — 데모 서버는 현재 중단된 상태입니다 (부트캠프 과정 종료로 GCP 인스턴스 정리). 코드와 아래 문서로 확인해 주세요.
 
